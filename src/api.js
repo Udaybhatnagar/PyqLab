@@ -1,5 +1,8 @@
+import { productionApi, productionFrontend } from './deployment';
+
 const storageKey = 'pyq.workspace';
-const apiOrigin = (import.meta.env.VITE_API_ORIGIN ?? '').trim().replace(/\/+$/, '');
+const configuredApi = (import.meta.env.VITE_API_ORIGIN ?? '').trim().replace(/\/+$/, '');
+const apiOrigin = configuredApi || (location.origin === productionFrontend ? productionApi : '');
 let workspace = localStorage.getItem(storageKey);
 if (!workspace) {
   workspace = crypto.randomUUID();

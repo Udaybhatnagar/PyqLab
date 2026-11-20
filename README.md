@@ -41,11 +41,13 @@ The repository root contains the app. You can serve everything from Render, or h
 
 ### 2. Optional Vercel frontend
 
+The production app at [pyq-lab-beta.vercel.app](https://pyq-lab-beta.vercel.app/) already defaults to the API at [pyqlab.onrender.com](https://pyqlab.onrender.com/). The environment settings below apply to additional deployments or a different API origin.
+
 1. In Vercel, choose **Add New → Project** and import the same GitHub repository. Select **Vite**, keep the root at the repository root, use Node 24, and set the build command to `npm run build` and output directory to `dist`.
 2. Add the production environment variable `VITE_API_ORIGIN` with the Render origin, for example `https://<service>.onrender.com`. Deploy, then copy the stable production Vercel URL.
 3. Back on Render, set `FRONTEND_ORIGIN` to that Vercel origin, for example `https://<project>.vercel.app`, and redeploy the API. Use a comma-separated list if you have more than one approved frontend origin. Use origins with no `/api` suffix in either setting.
 4. Open the Vercel URL, import a small test PDF, complete a practice attempt, and check My progress.
 
-The database credential belongs in **Render's** `DATABASE_URL`. The Vercel `VITE_API_ORIGIN` is a public URL. PDF uploads and OCR go directly to Render.
+Set the database credential in **Render's** `DATABASE_URL` and use `sslmode=verify-full` for Neon. The Vercel `VITE_API_ORIGIN` is a public URL. PDF uploads and OCR go directly to Render.
 
 [Vite on Vercel](https://vercel.com/docs/frameworks/frontend/vite) · [Vercel project settings](https://vercel.com/docs/project-configuration/project-settings)

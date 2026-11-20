@@ -10,12 +10,18 @@ import { collectAnswers, extractAnswerKey, isPdf, matchAnswerKey, readAnswerEntr
 import { cropImage, renderPage, validCrop } from './diagrams.mjs';
 import { validChoiceLabel } from '../src/paper-text.js';
 import { paperLanguages } from './ocr.mjs';
+import { productionFrontend } from '../src/deployment.js';
 import { samplePapers } from '../src/demo.js';
 
 const app = express();
 const root = fileURLToPath(new URL('../', import.meta.url));
-const pool = process.env.DATABASE_URL ? new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
+const databaseUrl = process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL) : null;
+if (databaseUrl?.hostname.endsWith('.neon.tech') && databaseUrl.searchParams.get('sslmode') === 'require' &&
+    !databaseUrl.searchParams.has('uselibpqcompat')) {
+  databaseUrl.searchParams.set('sslmode', 'verify-full');
+}
+const pool = databaseUrl ? new pg.Pool({
+  connectionString: databaseUrl.toString(),
   enableChannelBinding: true,
   connectionTimeoutMillis: 8000,
 }) : null;
@@ -28,8 +34,8 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 let databaseReady;
 let importsRunning = 0;
 const pageCache = new Map();
-const frontendOrigins = new Set((process.env.FRONTEND_ORIGIN ?? '').split(',')
-  .map((value) => value.trim().replace(/\/+$/, '')).filter(Boolean));
+const frontendOrigins = new Set([productionFrontend, ...(process.env.FRONTEND_ORIGIN ?? '').split(',')
+  .map((value) => value.trim().replace(/\/+$/, '')).filter(Boolean)]);
 const activeAttempt = 'NOT EXISTS (SELECT 1 FROM pyq_lab_papers deleted ' +
   'WHERE deleted.workspace = a.workspace AND deleted.id::text = a.paper_id AND deleted.deleted_at IS NOT NULL)';
 
