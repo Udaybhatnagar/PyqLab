@@ -6,6 +6,9 @@ import { TextPreview } from './TextPreview';
 import { DiagramPicker, FigureEditor } from './diagrams';
 import { Modal } from './Modal';
 
+const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const temporaryFailure = (issue) => [0, 408, 429, 502, 503, 504].includes(issue.status);
+
 export function UploadDialog({ onClose, onImported }) {
   const input = useRef(null);
   const keyInput = useRef(null);
@@ -16,10 +19,13 @@ export function UploadDialog({ onClose, onImported }) {
   const [language, setLanguage] = useState('auto');
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState('');
+  const [jobId, setJobId] = useState(null);
+  const [progress, setProgress] = useState('');
 
   function pick(candidate) {
     if (busy || !candidate) return;
     setError('');
+    setJobId(null);
     if (!/\.pdf$/i.test(candidate.name) && candidate.type !== 'application/pdf') {
       setFile(null);
       setError('Select a PDF file.');
@@ -36,6 +42,7 @@ export function UploadDialog({ onClose, onImported }) {
   function pickKey(candidate) {
     if (!candidate || busy) return;
     setError('');
+    setJobId(null);
     if (!/\.(pdf|jpe?g)$/i.test(candidate.name) && !['application/pdf', 'image/jpeg'].includes(candidate.type)) {
       setError('Choose a PDF or JPG for the answer key.');
       return;
@@ -52,15 +59,60 @@ export function UploadDialog({ onClose, onImported }) {
     if (!file || busy) return;
     setBusy(true);
     setError('');
-    const body = new FormData();
-    body.append('pdf', file);
-    body.append('language', language);
-    if (keyFile) {
-      body.append('answerKey', keyFile);
-      body.append('startQuestion', startQuestion);
+    const id = jobId ?? crypto.randomUUID();
+    const endpoint = '/import/jobs/' + id;
+    try {
+      if (!jobId) {
+        setProgress('Uploading the PDF…');
+        const body = new FormData();
+        body.append('pdf', file);
+        body.append('language', language);
+        if (keyFile) {
+          body.append('answerKey', keyFile);
+          body.append('startQuestion', startQuestion);
+        }
+        const start = () => api(endpoint, { method: 'POST', body, signal: AbortSignal.timeout(90000) });
+        try { await start(); }
+        catch (issue) {
+          if (!temporaryFailure(issue)) throw issue;
+          setProgress('Reconnecting to the upload server…');
+          await pause(3000);
+          try { await api(endpoint, { signal: AbortSignal.timeout(15000) }); }
+          catch (checkError) {
+            if (checkError.status !== 404 && !temporaryFailure(checkError)) throw checkError;
+            await start();
+          }
+        }
+        setJobId(id);
+      }
+      setProgress('PDF uploaded. Waiting for extraction to start…');
+      const deadline = Date.now() + 25 * 60 * 1000;
+      while (Date.now() < deadline) {
+        let job;
+        try { job = await api(endpoint, { signal: AbortSignal.timeout(20000) }); }
+        catch (issue) {
+          if (!temporaryFailure(issue)) {
+            if (issue.status === 404) setJobId(null);
+            throw issue;
+          }
+          setProgress('The server is reconnecting. We’ll check this upload again.');
+          await pause(5000);
+          continue;
+        }
+        if (job.status === 'ready') return onImported(job.paper, file, keyFile);
+        if (job.status === 'failed') {
+          setJobId(null);
+          throw new Error(job.error || 'Extraction failed. Please try again.');
+        }
+        setProgress(job.status === 'queued' ? 'PDF uploaded. Waiting for extraction to start…' :
+          'Extracting questions. Scanned papers can take several minutes.');
+        await pause(3000);
+      }
+      throw new Error('This import is still pending. Select Check progress to keep waiting.');
+    } catch (issue) {
+      setError(issue.message);
+      setBusy(false);
     }
-    try { onImported(await api('/import', { method: 'POST', body }), file, keyFile); }
-    catch (issue) { setError(issue.message); setBusy(false); }
   }
 
   return <Modal title="Import a question paper" onClose={busy ? undefined : onClose}>
@@ -76,7 +128,7 @@ export function UploadDialog({ onClose, onImported }) {
         <small>{file ? (file.size / 1024 / 1024).toFixed(2) + ' MB · Click to replace' : 'PDF up to 20 MB and 100 pages'}</small>
       </button>
       <label className="key-start-label">Paper language
-        <select aria-label="Paper language" value={language} disabled={busy} onChange={(event) => setLanguage(event.target.value)}>
+        <select aria-label="Paper language" value={language} disabled={busy} onChange={(event) => { setLanguage(event.target.value); setJobId(null); }}>
           <option value="auto">Automatic (Hindi and English)</option>
           <option value="hindi">Hindi (हिन्दी)</option>
           <option value="english">English</option>
@@ -90,16 +142,16 @@ export function UploadDialog({ onClose, onImported }) {
         <button type="button" className="button outline" aria-label={keyFile ? 'Replace answer key' : 'Choose answer key'}
           disabled={busy} onClick={() => keyInput.current.click()}>{keyFile ? 'Replace' : 'Choose file'}</button>
         {keyFile && <button type="button" className="icon-button" aria-label="Remove answer key" disabled={busy}
-          onClick={() => { setKeyFile(null); setError(''); }}><X size={17}/></button>}
+          onClick={() => { setKeyFile(null); setJobId(null); setError(''); }}><X size={17}/></button>}
       </div>
       {keyFile && <label className="key-start-label">First question number for an unnumbered key
-        <input type="number" min="1" max="9999" value={startQuestion} disabled={busy} required onChange={(event) => setStartQuestion(event.target.value)}/>
+        <input type="number" min="1" max="9999" value={startQuestion} disabled={busy} required onChange={(event) => { setStartQuestion(event.target.value); setJobId(null); }}/>
       </label>}
       {error && <p className="error-text" role="alert">{error}</p>}
-      {busy && <p className="inline-loading" role="status"><LoaderCircle size={16} className="spin"/> {keyFile ? 'Reading the answer key and questions…' : 'Extracting questions…'} Scans can take a few minutes.</p>}
+      {busy && <p className="inline-loading" role="status"><LoaderCircle size={16} className="spin"/> {progress}</p>}
       <div className="modal-actions">
         <button type="button" className="button outline" disabled={busy} onClick={onClose}>Cancel</button>
-        <button type="submit" className="button primary" disabled={!file || busy}>{busy ? <LoaderCircle size={17} className="spin"/> : <UploadCloud size={17}/>} Extract questions</button>
+        <button type="submit" className="button primary" disabled={!file || busy}>{busy ? <LoaderCircle size={17} className="spin"/> : <UploadCloud size={17}/>} {jobId && !busy ? 'Check progress' : 'Extract questions'}</button>
       </div>
     </form>
   </Modal>;

@@ -10,20 +10,20 @@ if (!workspace) {
 }
 
 export async function api(path, options = {}) {
-  const { body, method = 'GET' } = options;
+  const { body, method = 'GET', signal } = options;
   const headers = { 'X-Study-Workspace': workspace };
   if (body && !(body instanceof FormData)) headers['Content-Type'] = 'application/json';
   let response;
   try {
     response = await fetch(apiOrigin + '/api' + path, {
-      method, headers, body: body instanceof FormData ? body : body && JSON.stringify(body),
+      method, headers, signal, body: body instanceof FormData ? body : body && JSON.stringify(body),
     });
   } catch {
-    throw new Error('Could not reach the server. Check your connection and try again.');
+    throw Object.assign(new Error('Could not reach the server. Check your connection and try again.'), { status: 0 });
   }
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || 'Something went wrong. Please try again.');
+    throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), { status: response.status });
   }
   if (response.status === 204) return;
   return options.blob ? response.blob() : response.json();

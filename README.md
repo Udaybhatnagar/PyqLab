@@ -11,6 +11,7 @@ For a production build, run `npm run build` followed by `npm start`. The server 
 ## Practice workflow
 
 1. Import a question-paper PDF up to 20 MB and 100 pages. A separate answer key can be a PDF (up to 20 pages) or JPG (up to 16 megapixels), up to 20 MB. The key can contain numbered choices such as `1. B` and `2. A, C`, ranges such as `12–14: B | (A,D) | C`, or an unnumbered sequence with a specified first question number.
+   After the file uploads, the app checks extraction progress separately. Keep the import dialog open to review the questions when they are ready.
 2. Check the extracted text, choices, diagrams, and answer-key matches against the source. The uploaded key takes precedence for questions it can match. Use **View answer key** to compare the selections, or tick correct choices manually. Use **Add diagram** to crop missing figures. Complex layouts and scans may require manual corrections.
 3. Save the set under a subject, then choose all questions, MCQs only, or MSQs only. Use the navigator to jump between questions and mark them Important, Needs review, or Needs topic revision.
 4. Submit to see your selected letters and the correct choices, where mapped. An MSQ earns credit when the selection exactly matches the key. Use **Match answer key** in Paper library or ungraded results to upload a key or paste answers. Saving the confirmed matches updates existing scores.

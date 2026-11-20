@@ -12,6 +12,7 @@ import { validChoiceLabel } from '../src/paper-text.js';
 import { paperLanguages } from './ocr.mjs';
 import { productionFrontend } from '../src/deployment.js';
 import { samplePapers } from '../src/demo.js';
+import { importJobSchema, runImportJobs } from './import-jobs.mjs';
 
 const app = express();
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -27,12 +28,13 @@ const pool = databaseUrl ? new pg.Pool({
 }) : null;
 pool?.on('error', (error) => console.error('Database connection lost:', error.code ?? error.name));
 app.disable('x-powered-by');
-app.use('/api', express.json({ limit: '8mb' }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 2, fields: 2, fieldSize: 64 } });
 const importFiles = upload.fields([{ name: 'pdf', maxCount: 1 }, { name: 'answerKey', maxCount: 1 }]);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 let databaseReady;
 let importsRunning = 0;
+let importWorkerRunning = false;
+const importConcurrency = process.env.RENDER ? 1 : 2;
 const pageCache = new Map();
 const frontendOrigins = new Set([productionFrontend, ...(process.env.FRONTEND_ORIGIN ?? '').split(',')
   .map((value) => value.trim().replace(/\/+$/, '')).filter(Boolean)]);
@@ -54,6 +56,7 @@ async function connect() {
     'id uuid PRIMARY KEY, workspace uuid NOT NULL, paper_id text NOT NULL, ' +
     'result jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now());' +
     'CREATE INDEX IF NOT EXISTS pyq_lab_attempts_workspace ON pyq_lab_attempts (workspace, created_at DESC);' +
+    importJobSchema +
     'DELETE FROM pyq_lab_papers WHERE title IS NULL AND created_at < now() - interval \'1 day\';'
   ).catch((error) => {
     databaseReady = undefined;
@@ -78,6 +81,7 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
+app.use('/api', express.json({ limit: '8mb' }));
 app.use('/api', async (req, res, next) => {
   res.set('Cache-Control', 'no-store');
   const workspace = req.get('x-study-workspace');
@@ -120,36 +124,85 @@ app.get('/api/improvement', async (req, res) => {
   res.json([...papers.values()].map((paper) => ({ ...paper, questions: [...paper.questions.values()] })));
 });
 
-app.post('/api/import', importFiles, async (req, res) => {
+function importInput(req) {
   const file = req.files?.pdf?.[0];
   const answerKey = req.files?.answerKey?.[0];
   const sequenceStart = readSequenceStart(req.body?.startQuestion);
   const language = req.body?.language ?? 'auto';
   if (!paperLanguages.has(language)) throw requestError(400, 'Choose Automatic, Hindi, or English for the paper.');
-  if (!file || !isPdf(file.buffer)) {
-    return res.status(415).json({ error: 'Choose a valid question-paper PDF.' });
-  }
-  if (importsRunning >= 2) return res.status(429).json({ error: 'Two PDFs are being processed. Please try again in a moment.' });
-  let extracted;
-  let key;
-  importsRunning++;
+  if (!file || !isPdf(file.buffer)) throw requestError(415, 'Choose a valid question-paper PDF.');
+  return { file, answerKey, sequenceStart, language };
+}
+
+async function parseImport({ file, answerKey, sequenceStart, language }) {
   try {
-    key = answerKey && await extractAnswerKey(answerKey, sequenceStart, language);
-    extracted = await extractPaper(file.buffer, key?.answers, language);
+    const key = answerKey && await extractAnswerKey(answerKey, sequenceStart, language);
+    const { matched, ...paper } = await extractPaper(file.buffer, key?.answers, language);
+    return { ...paper, answerKey: key ? describeKey(key, answerKey.originalname, matched) : null };
   } catch (error) {
-    return res.status(error.status ?? 422).json({
-      error: error.status ? error.message : 'This PDF could not be opened. Make sure it is readable and password-free.',
-    });
-  } finally {
-    importsRunning--;
+    if (error.status) throw error;
+    throw requestError(422, 'This PDF could not be opened. Make sure it is readable and password-free.');
   }
+}
+
+app.post('/api/import', importFiles, async (req, res) => {
+  const input = importInput(req);
+  if (importsRunning >= importConcurrency) throw requestError(429, 'Other imports are in progress. Try again in a moment.');
+  importsRunning++;
+  let paper;
+  try { paper = await parseImport(input); }
+  finally { importsRunning--; }
   const id = randomUUID();
-  const filename = file.originalname.slice(0, 240);
-  const { matched, ...paper } = extracted;
-  const info = key ? describeKey(key, answerKey.originalname, matched) : null;
+  const filename = input.file.originalname.slice(0, 240);
   await pool.query('INSERT INTO pyq_lab_papers (id, workspace, filename, pdf, pages, answer_key, extracted_text) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-    [id, req.workspace, filename, file.buffer, extracted.pages, info, extracted.extractedText]);
-  res.status(201).json({ id, filename, ...paper, answerKey: info });
+    [id, req.workspace, filename, input.file.buffer, paper.pages, paper.answerKey, paper.extractedText]);
+  res.status(201).json({ id, filename, ...paper });
+});
+
+function scheduleImports() {
+  if (importWorkerRunning || importsRunning >= importConcurrency) return;
+  importWorkerRunning = true;
+  importsRunning++;
+  setImmediate(async () => {
+    try { await runImportJobs(pool, transaction, parseImport); }
+    catch (issue) { console.error('Import queue failed:', issue.code ?? issue.name); }
+    finally { importWorkerRunning = false; importsRunning--; }
+  });
+}
+
+app.post('/api/import/jobs/:id', importFiles, async (req, res) => {
+  const { id } = req.params;
+  if (!uuid.test(id)) throw requestError(400, 'Invalid import ID.');
+  const { file, answerKey, sequenceStart, language } = importInput(req);
+  await transaction(async (db) => {
+    const inserted = await db.query(
+      'INSERT INTO pyq_lab_papers (id, workspace, filename, pdf, pages) VALUES ($1, $2, $3, $4, 0) ON CONFLICT DO NOTHING',
+      [id, req.workspace, file.originalname.slice(0, 240), file.buffer],
+    );
+    if (inserted.rowCount) {
+      await db.query('INSERT INTO pyq_lab_import_jobs (id, options, key_data) VALUES ($1, $2, $3)',
+        [id, { sequenceStart, language, keyName: answerKey?.originalname.slice(0, 240) }, answerKey?.buffer ?? null]);
+    } else {
+      const prior = await db.query('SELECT 1 FROM pyq_lab_import_jobs j JOIN pyq_lab_papers p USING (id) WHERE j.id = $1 AND p.workspace = $2',
+        [id, req.workspace]);
+      if (!prior.rowCount) throw requestError(409, 'This import could not be started. Choose the file again.');
+    }
+  });
+  res.status(202).json({ id });
+  scheduleImports();
+});
+
+app.get('/api/import/jobs/:id', async (req, res) => {
+  if (!uuid.test(req.params.id)) throw requestError(404, 'Import could not be found.');
+  const { rows } = await pool.query(
+    'SELECT j.status, j.error, j.result, p.id, p.filename, p.pages, p.extracted_text AS "extractedText", p.answer_key AS "answerKey" ' +
+    'FROM pyq_lab_import_jobs j JOIN pyq_lab_papers p USING (id) WHERE j.id = $1 AND p.workspace = $2',
+    [req.params.id, req.workspace],
+  );
+  if (!rows.length) throw requestError(404, 'This import could not be found. Upload the PDF again.');
+  const { status, error, result, ...paper } = rows[0];
+  res.json({ status, ...(status === 'ready' ? { paper: { ...paper, ...result } } : { error }) });
+  if (status === 'queued' || status === 'running') scheduleImports();
 });
 
 app.param('id', (req, res, next, id) => {
@@ -166,6 +219,7 @@ app.delete('/api/papers/:id', async (req, res) => {
     );
     if (!removed.rowCount) throw requestError(404, 'This paper could not be found.');
     await db.query('DELETE FROM pyq_lab_attempts WHERE workspace = $1 AND paper_id = $2', [req.workspace, req.params.id]);
+    await db.query('DELETE FROM pyq_lab_import_jobs WHERE id = $1', [req.params.id]);
   });
   const prefix = req.workspace + '/' + req.params.id + '/';
   for (const key of pageCache.keys()) {
@@ -336,7 +390,7 @@ app.post('/api/papers/:id/answer-key', upload.single('answerKey'), async (req, r
   const { text, startQuestion } = req.body ?? {};
   const start = readSequenceStart(startQuestion);
   if (!req.file && !textField(text, 30000)) throw requestError(400, 'Upload a PDF or JPG key, or paste up to 30,000 characters.');
-  if (importsRunning >= 2) throw requestError(429, 'Other imports are in progress. Try again in a moment.');
+  if (importsRunning >= importConcurrency) throw requestError(429, 'Other imports are in progress. Try again in a moment.');
   let key;
   importsRunning++;
   try {
@@ -488,5 +542,7 @@ if (process.env.npm_lifecycle_event === 'dev') {
 const port = Number(process.env.PORT ?? 5173);
 const host = process.env.HOST || '127.0.0.1';
 const server = app.listen(port, host);
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
 await once(server, 'listening');
 console.log('PYQ Lab is running at http://' + host + ':' + port);

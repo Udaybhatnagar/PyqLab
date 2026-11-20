@@ -177,7 +177,7 @@ export async function extractAnswerKey(file, sequenceStart = 1, language = 'auto
   try {
     let text;
     if (isPdf(buffer)) {
-      parser = new PDFParse({ data: new Uint8Array(buffer), isEvalSupported: false });
+      parser = new PDFParse({ data: new Uint8Array(buffer), isEvalSupported: false, maxImageSize: 16_000_000 });
       const { total } = await parser.getInfo();
       if (total > 20) throw badKey('Use an answer-key PDF with 20 pages or fewer.');
       const { pages } = await parser.getText({ lineThreshold: 4, lineEnforce: true, cellSeparator: ' ' });

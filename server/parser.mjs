@@ -198,7 +198,7 @@ function questionScore(page) {
 }
 
 export async function extractPaper(buffer, suppliedAnswers, language = 'auto') {
-  const parser = new PDFParse({ data: new Uint8Array(buffer), isEvalSupported: false });
+  const parser = new PDFParse({ data: new Uint8Array(buffer), isEvalSupported: false, maxImageSize: 16_000_000 });
   let worker;
   let hindiWorker;
   try {
