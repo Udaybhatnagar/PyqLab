@@ -1,6 +1,6 @@
 # PYQ Lab
 
-A no-signup practice workspace for previous-year question papers. React and Vite power the frontend. Express processes PDFs and stores original files, practice sets, and submitted attempts in PostgreSQL.
+A no-signup practice workspace for previous-year question papers. React and Vite power the frontend. Original question-paper PDFs live in the browser. Express uses temporary upload files for extraction and stores practice data and attempts in PostgreSQL.
 
 ## Run locally
 
@@ -18,6 +18,8 @@ For a production build, run `npm run build` followed by `npm start`. The server 
 5. Open **Improvement** to revisit questions marked Important or Needs topic revision. It groups paused and submitted questions by paper and provides paper and marker filters.
 
 Use the delete action in **Paper library** to remove an imported paper, its paused drafts, its completed results, and its marked questions from Improvement.
+
+Original PDFs and their diagrams are available in the browser profile and site where you imported them. Keep a downloaded backup before clearing site data. To remove an older PDF from Neon, open its source PDF in **Paper library**, select **Move PDF to this browser**, and confirm. The app verifies the saved browser copy before removing the database copy.
 
 ### Hindi papers
 

@@ -14,6 +14,7 @@ import { Landing, Logo } from './Landing';
 import { Improvement } from './Improvement';
 import { AnswerKeyDialog } from './AnswerKey';
 import { TextPreview } from './TextPreview';
+import { getLocalPdf, pdfDigest, removeLocalPdf, saveLocalPdf } from './pdf-storage';
 import './style.css';
 
 const sampleIndex = new Map(samplePapers.map((paper) => [paper.id, paper]));
@@ -93,6 +94,7 @@ function DeletePaperDialog({ paper, onCancel, onDeleted }) {
     setError('');
     try {
       await api('/papers/' + paper.id, { method: 'DELETE' });
+      await removeLocalPdf(paper.id).catch(() => {});
       Object.keys(filters).forEach((filter) => localStorage.removeItem(draftKey(paper.id, filter)));
       onDeleted(paper);
     } catch (issue) {
@@ -190,16 +192,33 @@ function App() {
   }
 
   async function openPdf(paper) {
-    setPdf({ id: paper.id, title: paper.title || paper.filename });
+    setPdf({ id: paper.id, title: paper.title || paper.filename, hasServerPdf: paper.hasServerPdf });
     try {
-      const blob = await api('/papers/' + paper.id + '/pdf', { blob: true });
+      const local = await getLocalPdf(paper.id).catch(() => null);
+      if (!local && paper.hasServerPdf === false) throw new Error('The original PDF is available in the browser where it was imported or moved.');
+      const blob = local ?? await api('/papers/' + paper.id + '/pdf', { blob: true });
       const url = URL.createObjectURL(blob);
       setPdf((current) => {
         if (current?.id !== paper.id) { URL.revokeObjectURL(url); return current; }
-        return { ...current, url };
+        return { ...current, url, blob, local: Boolean(local) };
       });
     } catch (error) {
-      setPdf((current) => current && { ...current, error: error.message });
+      setPdf((current) => current?.id === paper.id ? { ...current, error: error.message } : current);
+    }
+  }
+
+  async function movePdf(paper) {
+    setPdf((current) => ({ ...current, moving: true, moveError: '' }));
+    try {
+      await saveLocalPdf(paper.id, paper.blob);
+      const local = await getLocalPdf(paper.id);
+      if (!local || local.size !== paper.blob.size) throw new Error('The browser copy could not be verified. The database copy was kept.');
+      await api('/papers/' + paper.id + '/pdf', { method: 'DELETE', body: { sha256: await pdfDigest(local) } });
+      setPdf((current) => ({ ...current, moving: false, confirmMove: false, hasServerPdf: false, local: true }));
+      setNotice('PDF moved to this browser.');
+      refresh();
+    } catch (issue) {
+      setPdf((current) => ({ ...current, moving: false, moveError: issue.message }));
     }
   }
 
@@ -302,7 +321,10 @@ function App() {
       </div>
     </div>}
     {uploadOpen && <UploadDialog onClose={() => setUploadOpen(false)} onImported={(data, file, keyFile) => { setUploadOpen(false); setImported({ data, file, keyFile }); }}/>}
-    {imported && <ImportEditor data={imported.data} file={imported.file} keyFile={imported.keyFile} subjects={subjects} onClose={() => setImported(null)} onSaved={(paper) => { setImported(null); refresh(); openLibrary(); setNotice('Paper added to your library.'); openPractice(paper); }}/>}
+    {imported && <ImportEditor data={imported.data} file={imported.file} keyFile={imported.keyFile} subjects={subjects} onClose={() => {
+      removeLocalPdf(imported.data.id).catch(() => {});
+      setImported(null);
+    }} onSaved={(paper) => { setImported(null); refresh(); openLibrary(); setNotice('Paper added to your library.'); openPractice(paper); }}/>}
     {removePaper && <DeletePaperDialog paper={removePaper} onCancel={() => setRemovePaper(null)} onDeleted={(paper) => {
       setRemovePaper(null);
       setLibrary((current) => ({
@@ -330,15 +352,25 @@ function App() {
         <div className="modal-actions"><button className="button outline" onClick={() => setSetup(null)}>Cancel</button><button className="button primary" disabled={!activeQuestions.length} onClick={() => { go('practice/' + setup.paper.id + '/' + filter); setSetup(null); }}><BookOpenCheck size={18}/>{readDraft(setup.paper.id, filter) ? 'Resume practice' : 'Start practice'}</button></div>
       </>}
     </Modal>}
-    {pdf && <Modal className="pdf-modal" title={pdf.title} onClose={() => { if (pdf.url) URL.revokeObjectURL(pdf.url); setPdf(null); }}>
+    {pdf && <Modal className="pdf-modal" title={pdf.title} onClose={pdf.moving ? undefined : () => { if (pdf.url) URL.revokeObjectURL(pdf.url); setPdf(null); }}>
       {pdf.showText ? <>
         <button className="button outline" onClick={() => setPdf((current) => ({ ...current, showText: false }))}>Back to PDF</button>
         {pdf.text !== undefined ? <TextPreview text={pdf.text} filename={pdf.title}/> :
           pdf.textError ? <p className="error-text" role="alert">{pdf.textError}</p> : <p className="inline-loading" role="status">Loading extracted text…</p>}
+      </> : pdf.confirmMove ? <>
+        <p className="modal-lead">Move this PDF to this browser and remove its Neon copy? Your practice set and scores will stay available. Download a backup to keep the original if you clear this site’s browser data.</p>
+        {pdf.moveError && <p className="error-text" role="alert">{pdf.moveError}</p>}
+        <div className="modal-actions">
+          <button className="button outline" disabled={pdf.moving} onClick={() => setPdf((current) => ({ ...current, confirmMove: false }))}>Cancel</button>
+          <button className="button primary" disabled={pdf.moving} onClick={() => movePdf(pdf)}>{pdf.moving ? 'Moving PDF…' : 'Move PDF'}</button>
+        </div>
       </> : pdf.url ? <><iframe src={pdf.url} title="Original question paper"/><div className="modal-actions">
+        {pdf.hasServerPdf && <button className="button outline" onClick={() => setPdf((current) => ({ ...current, confirmMove: true }))}>Move PDF to this browser</button>}
         <button className="button outline" onClick={() => openPdfText(pdf)}>View extracted text</button>
         <a className="button outline" href={pdf.url} download={pdf.title + '.pdf'}><ArrowDownToLine size={17}/>Download PDF</a></div></> :
-        pdf.error ? <p className="error-text" role="alert">{pdf.error}</p> : <p role="status">Loading PDF…</p>}
+        pdf.error ? <><p className="error-text" role="alert">{pdf.error}</p><div className="modal-actions">
+          <button className="button outline" onClick={() => openPdfText(pdf)}>View extracted text</button>
+        </div></> : <p role="status">Loading PDF…</p>}
     </Modal>}
     {notice && <div className="toast" role="status"><Check size={18}/>{notice}</div>}
   </>;

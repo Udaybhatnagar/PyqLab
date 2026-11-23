@@ -1,3 +1,5 @@
+import { readImportFiles, removeImportFiles, uploadOwner } from './import-files.mjs';
+
 export const importJobSchema = `
   CREATE TABLE IF NOT EXISTS pyq_lab_import_jobs (
     id uuid PRIMARY KEY REFERENCES pyq_lab_papers(id) ON DELETE CASCADE,
@@ -18,14 +20,15 @@ export async function runImportJobs(pool, transaction, parseImport) {
     const { rows } = await pool.query(`
       WITH next_job AS (
         SELECT id FROM pyq_lab_import_jobs
-        WHERE status = 'queued' OR (status = 'running' AND lease_until < now() AND attempts < 2)
+        WHERE (options->>'uploadOwner' IS NULL OR options->>'uploadOwner' = $1)
+          AND (status = 'queued' OR (status = 'running' AND lease_until < now() AND attempts < 2))
         ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
       )
       UPDATE pyq_lab_import_jobs j SET status = 'running', attempts = j.attempts + 1,
         lease_until = now() + interval '90 seconds'
       FROM next_job n, pyq_lab_papers p WHERE j.id = n.id AND p.id = j.id
       RETURNING j.id, j.attempts, j.options, j.key_data, p.pdf
-    `);
+    `, [uploadOwner]);
     const job = rows[0];
     if (!job) return;
     const keepLease = setInterval(() => {
@@ -36,26 +39,30 @@ export async function runImportJobs(pool, transaction, parseImport) {
     try {
       let paper;
       try {
-        paper = await parseImport({
+        const input = job.options.stage ? await readImportFiles(job.options) : {
           file: { buffer: job.pdf },
           answerKey: job.key_data && { buffer: job.key_data, originalname: job.options.keyName },
+        };
+        paper = await parseImport({
+          ...input,
           sequenceStart: job.options.sequenceStart,
           language: job.options.language,
         });
       } catch (issue) {
-        await pool.query("UPDATE pyq_lab_import_jobs SET status = 'failed', error = $3, key_data = NULL WHERE id = $1 AND attempts = $2",
-          [job.id, job.attempts, issue.status ? issue.message : 'Extraction failed. Please try again.']);
+        await pool.query("UPDATE pyq_lab_import_jobs SET status = $3, error = $4, key_data = NULL WHERE id = $1 AND attempts = $2 AND status = 'running'",
+          [job.id, job.attempts, issue.code === 'ENOENT' ? 'needs-upload' : 'failed', issue.status ? issue.message : 'Extraction failed. Please try again.']);
         continue;
       }
       const { pages, answerKey, extractedText, ...result } = paper;
       await transaction(async (db) => {
-        const completed = await db.query("UPDATE pyq_lab_import_jobs SET status = 'ready', result = $3, key_data = NULL WHERE id = $1 AND attempts = $2",
+        const completed = await db.query("UPDATE pyq_lab_import_jobs SET status = 'ready', result = $3, key_data = NULL WHERE id = $1 AND attempts = $2 AND status = 'running'",
           [job.id, job.attempts, result]);
         if (completed.rowCount) await db.query('UPDATE pyq_lab_papers SET pages = $2, answer_key = $3, extracted_text = $4 WHERE id = $1',
           [job.id, pages, answerKey, extractedText]);
       });
     } finally {
       clearInterval(keepLease);
+      await removeImportFiles(job.options.stage);
     }
   }
 }

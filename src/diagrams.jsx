@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Crop, ImagePlus, LoaderCircle, Trash2 } from 'lucide-react';
 import { api } from './api';
 import { Modal } from './Modal';
+import { getLocalPdf } from './pdf-storage';
 
 function imagePath(paperId, page, crop) {
   const path = '/papers/' + paperId + '/pages/' + page;
@@ -10,13 +11,23 @@ function imagePath(paperId, page, crop) {
   return path + '?' + new URLSearchParams({ left, top, right, bottom });
 }
 
+async function pageImage(path) {
+  const [pagePath, query] = path.split('?');
+  const [, , paperId, , page] = pagePath.split('/');
+  const local = await getLocalPdf(paperId).catch(() => null);
+  if (!local) return api(path, { blob: true });
+  const crop = query ? Object.fromEntries([...new URLSearchParams(query)].map(([key, value]) => [key, Number(value)])) : null;
+  const { renderPdfImage } = await import('./pdf-render');
+  return renderPdfImage(paperId, local, Number(page), crop);
+}
+
 function usePageImage(path) {
   const [image, setImage] = useState(null);
   useEffect(() => {
     let current = true;
     let url;
     setImage(null);
-    api(path, { blob: true }).then((blob) => {
+    pageImage(path).then((blob) => {
       if (!current) return;
       url = URL.createObjectURL(blob);
       setImage({ path, url });

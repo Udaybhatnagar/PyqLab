@@ -13,6 +13,7 @@ import { paperLanguages } from './ocr.mjs';
 import { productionFrontend } from '../src/deployment.js';
 import { samplePapers } from '../src/demo.js';
 import { importJobSchema, runImportJobs } from './import-jobs.mjs';
+import { removeImportFiles, stageImportFiles, uploadOwner } from './import-files.mjs';
 
 const app = express();
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -93,7 +94,7 @@ app.use('/api', async (req, res, next) => {
 
 app.get('/api/library', async (req, res) => {
   const [papers, attempts] = await Promise.all([
-    pool.query('SELECT id, filename, pages, title, subject, jsonb_array_length(questions) AS count, created_at AS "createdAt" FROM pyq_lab_papers WHERE workspace = $1 AND title IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC', [req.workspace]),
+    pool.query('SELECT id, filename, pages, title, subject, octet_length(pdf) > 0 AS "hasServerPdf", jsonb_array_length(questions) AS count, created_at AS "createdAt" FROM pyq_lab_papers WHERE workspace = $1 AND title IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC', [req.workspace]),
     pool.query('SELECT a.id, a.paper_id AS "paperId", a.created_at AS "createdAt", a.result - \'items\' AS result ' +
       'FROM pyq_lab_attempts a WHERE a.workspace = $1 AND ' + activeAttempt + ' ORDER BY a.created_at DESC LIMIT 300', [req.workspace]),
   ]);
@@ -155,7 +156,7 @@ app.post('/api/import', importFiles, async (req, res) => {
   const id = randomUUID();
   const filename = input.file.originalname.slice(0, 240);
   await pool.query('INSERT INTO pyq_lab_papers (id, workspace, filename, pdf, pages, answer_key, extracted_text) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-    [id, req.workspace, filename, input.file.buffer, paper.pages, paper.answerKey, paper.extractedText]);
+    [id, req.workspace, filename, Buffer.alloc(0), paper.pages, paper.answerKey, paper.extractedText]);
   res.status(201).json({ id, filename, ...paper });
 });
 
@@ -173,21 +174,36 @@ function scheduleImports() {
 app.post('/api/import/jobs/:id', importFiles, async (req, res) => {
   const { id } = req.params;
   if (!uuid.test(id)) throw requestError(400, 'Invalid import ID.');
+  if (req.query.storage !== 'browser') throw requestError(409, 'Refresh PYQ Lab to use browser PDF storage, then try again.');
   const { file, answerKey, sequenceStart, language } = importInput(req);
-  await transaction(async (db) => {
-    const inserted = await db.query(
-      'INSERT INTO pyq_lab_papers (id, workspace, filename, pdf, pages) VALUES ($1, $2, $3, $4, 0) ON CONFLICT DO NOTHING',
-      [id, req.workspace, file.originalname.slice(0, 240), file.buffer],
-    );
-    if (inserted.rowCount) {
-      await db.query('INSERT INTO pyq_lab_import_jobs (id, options, key_data) VALUES ($1, $2, $3)',
-        [id, { sequenceStart, language, keyName: answerKey?.originalname.slice(0, 240) }, answerKey?.buffer ?? null]);
-    } else {
+  const stage = await stageImportFiles(file, answerKey);
+  const options = { stage, uploadOwner, sequenceStart, language, keyName: answerKey?.originalname.slice(0, 240) };
+  let retained = false;
+  try {
+    retained = await transaction(async (db) => {
+      const inserted = await db.query(
+        'INSERT INTO pyq_lab_papers (id, workspace, filename, pdf, pages) VALUES ($1, $2, $3, $4, 0) ON CONFLICT DO NOTHING',
+        [id, req.workspace, file.originalname.slice(0, 240), Buffer.alloc(0)],
+      );
+      if (inserted.rowCount) {
+        await db.query("INSERT INTO pyq_lab_import_jobs (id, options, lease_until) VALUES ($1, $2, now() + interval '90 seconds')", [id, options]);
+        return true;
+      }
+      const restarted = await db.query(
+        "UPDATE pyq_lab_import_jobs j SET status = 'queued', options = $3, key_data = NULL, error = NULL, lease_until = now() + interval '90 seconds' " +
+        "FROM pyq_lab_papers p WHERE p.id = j.id AND j.id = $1 AND p.workspace = $2 AND (j.status = 'needs-upload' OR " +
+        "(j.status IN ('queued','running') AND j.lease_until < now() AND j.options->>'uploadOwner' <> $4))",
+        [id, req.workspace, options, uploadOwner],
+      );
+      if (restarted.rowCount) return true;
       const prior = await db.query('SELECT 1 FROM pyq_lab_import_jobs j JOIN pyq_lab_papers p USING (id) WHERE j.id = $1 AND p.workspace = $2',
         [id, req.workspace]);
       if (!prior.rowCount) throw requestError(409, 'This import could not be started. Choose the file again.');
-    }
-  });
+      return false;
+    });
+  } finally {
+    if (!retained) await removeImportFiles(stage);
+  }
   res.status(202).json({ id });
   scheduleImports();
 });
@@ -195,9 +211,10 @@ app.post('/api/import/jobs/:id', importFiles, async (req, res) => {
 app.get('/api/import/jobs/:id', async (req, res) => {
   if (!uuid.test(req.params.id)) throw requestError(404, 'Import could not be found.');
   const { rows } = await pool.query(
-    'SELECT j.status, j.error, j.result, p.id, p.filename, p.pages, p.extracted_text AS "extractedText", p.answer_key AS "answerKey" ' +
+    "SELECT CASE WHEN j.status IN ('queued','running') AND j.lease_until < now() AND j.options->>'uploadOwner' <> $3 THEN 'needs-upload' ELSE j.status END AS status, " +
+    'j.error, j.result, p.id, p.filename, p.pages, p.extracted_text AS "extractedText", p.answer_key AS "answerKey" ' +
     'FROM pyq_lab_import_jobs j JOIN pyq_lab_papers p USING (id) WHERE j.id = $1 AND p.workspace = $2',
-    [req.params.id, req.workspace],
+    [req.params.id, req.workspace, uploadOwner],
   );
   if (!rows.length) throw requestError(404, 'This import could not be found. Upload the PDF again.');
   const { status, error, result, ...paper } = rows[0];
@@ -214,7 +231,7 @@ app.delete('/api/papers/:id', async (req, res) => {
   if (!uuid.test(req.params.id)) return res.status(404).json({ error: 'This paper could not be found.' });
   await transaction(async (db) => {
     const removed = await db.query(
-      'UPDATE pyq_lab_papers SET deleted_at = COALESCE(deleted_at, now()) WHERE id = $1 AND workspace = $2 AND title IS NOT NULL',
+      "UPDATE pyq_lab_papers SET deleted_at = COALESCE(deleted_at, now()), pdf = ''::bytea WHERE id = $1 AND workspace = $2 AND title IS NOT NULL",
       [req.params.id, req.workspace],
     );
     if (!removed.rowCount) throw requestError(404, 'This paper could not be found.');
@@ -230,9 +247,27 @@ app.delete('/api/papers/:id', async (req, res) => {
 
 app.get('/api/papers/:id/pdf', async (req, res) => {
   if (!uuid.test(req.params.id)) return res.sendStatus(404);
-  const { rows } = await pool.query('SELECT pdf FROM pyq_lab_papers WHERE id = $1 AND workspace = $2 AND deleted_at IS NULL', [req.params.id, req.workspace]);
+  const { rows } = await pool.query('SELECT pdf FROM pyq_lab_papers WHERE id = $1 AND workspace = $2 AND deleted_at IS NULL AND octet_length(pdf) > 0', [req.params.id, req.workspace]);
   if (!rows.length) return res.status(404).json({ error: 'PDF could not be found.' });
   res.type('pdf').set('X-Content-Type-Options', 'nosniff').send(rows[0].pdf);
+});
+
+app.delete('/api/papers/:id/pdf', async (req, res) => {
+  const digest = req.body?.sha256;
+  if (!uuid.test(req.params.id) || typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)) {
+    throw requestError(400, 'The local PDF copy must be verified first.');
+  }
+  const removed = await pool.query(
+    "UPDATE pyq_lab_papers SET pdf = ''::bytea WHERE id = $1 AND workspace = $2 AND title IS NOT NULL AND deleted_at IS NULL " +
+    "AND (octet_length(pdf) = 0 OR encode(sha256(pdf), 'hex') = $3)",
+    [req.params.id, req.workspace, digest],
+  );
+  if (!removed.rowCount) throw requestError(409, 'The stored PDF could not be matched. Its database copy was kept.');
+  const prefix = req.workspace + '/' + req.params.id + '/';
+  for (const key of pageCache.keys()) {
+    if (key.startsWith(prefix)) pageCache.delete(key);
+  }
+  res.sendStatus(204);
 });
 
 app.get('/api/papers/:id/text', async (req, res) => {
@@ -259,7 +294,7 @@ app.get('/api/papers/:id/pages/:page', async (req, res) => {
   let pending = pageCache.get(key);
   if (!pending) {
     pending = (async () => {
-      const { rows } = await pool.query('SELECT pdf FROM pyq_lab_papers WHERE id = $1 AND workspace = $2 AND pages >= $3 AND deleted_at IS NULL', [req.params.id, req.workspace, page]);
+      const { rows } = await pool.query('SELECT pdf FROM pyq_lab_papers WHERE id = $1 AND workspace = $2 AND pages >= $3 AND deleted_at IS NULL AND octet_length(pdf) > 0', [req.params.id, req.workspace, page]);
       if (!rows.length) throw Object.assign(new Error('The source PDF page could not be found.'), { status: 404 });
       return renderPage(rows[0].pdf, page);
     })();

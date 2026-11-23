@@ -5,6 +5,7 @@ import { contentLanguage, nextChoiceLabel } from './paper-text';
 import { TextPreview } from './TextPreview';
 import { DiagramPicker, FigureEditor } from './diagrams';
 import { Modal } from './Modal';
+import { removeLocalPdf, saveLocalPdf } from './pdf-storage';
 
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const temporaryFailure = (issue) => [0, 408, 429, 502, 503, 504].includes(issue.status);
@@ -21,11 +22,23 @@ export function UploadDialog({ onClose, onImported }) {
   const [error, setError] = useState('');
   const [jobId, setJobId] = useState(null);
   const [progress, setProgress] = useState('');
+  const storedId = useRef(null);
+
+  function forgetLocalCopy() {
+    if (storedId.current) removeLocalPdf(storedId.current).catch(() => {});
+    storedId.current = null;
+    setJobId(null);
+  }
+
+  function close() {
+    forgetLocalCopy();
+    onClose();
+  }
 
   function pick(candidate) {
     if (busy || !candidate) return;
     setError('');
-    setJobId(null);
+    forgetLocalCopy();
     if (!/\.pdf$/i.test(candidate.name) && candidate.type !== 'application/pdf') {
       setFile(null);
       setError('Select a PDF file.');
@@ -42,7 +55,7 @@ export function UploadDialog({ onClose, onImported }) {
   function pickKey(candidate) {
     if (!candidate || busy) return;
     setError('');
-    setJobId(null);
+    forgetLocalCopy();
     if (!/\.(pdf|jpe?g)$/i.test(candidate.name) && !['application/pdf', 'image/jpeg'].includes(candidate.type)) {
       setError('Choose a PDF or JPG for the answer key.');
       return;
@@ -61,17 +74,22 @@ export function UploadDialog({ onClose, onImported }) {
     setError('');
     const id = jobId ?? crypto.randomUUID();
     const endpoint = '/import/jobs/' + id;
+    const start = () => {
+      const body = new FormData();
+      body.append('pdf', file);
+      body.append('language', language);
+      if (keyFile) {
+        body.append('answerKey', keyFile);
+        body.append('startQuestion', startQuestion);
+      }
+      return api(endpoint + '?storage=browser', { method: 'POST', body, signal: AbortSignal.timeout(90000) });
+    };
     try {
       if (!jobId) {
+        if (storedId.current && storedId.current !== id) await removeLocalPdf(storedId.current);
+        await saveLocalPdf(id, file);
+        storedId.current = id;
         setProgress('Uploading the PDF…');
-        const body = new FormData();
-        body.append('pdf', file);
-        body.append('language', language);
-        if (keyFile) {
-          body.append('answerKey', keyFile);
-          body.append('startQuestion', startQuestion);
-        }
-        const start = () => api(endpoint, { method: 'POST', body, signal: AbortSignal.timeout(90000) });
         try { await start(); }
         catch (issue) {
           if (!temporaryFailure(issue)) throw issue;
@@ -100,6 +118,12 @@ export function UploadDialog({ onClose, onImported }) {
           continue;
         }
         if (job.status === 'ready') return onImported(job.paper, file, keyFile);
+        if (job.status === 'needs-upload') {
+          setProgress('The extraction server restarted. Resending your local PDF…');
+          await start();
+          await pause(3000);
+          continue;
+        }
         if (job.status === 'failed') {
           setJobId(null);
           throw new Error(job.error || 'Extraction failed. Please try again.');
@@ -115,8 +139,8 @@ export function UploadDialog({ onClose, onImported }) {
     }
   }
 
-  return <Modal title="Import a question paper" onClose={busy ? undefined : onClose}>
-    <p className="modal-lead">Upload a previous-year paper or mock exam to turn its questions into a practice set.</p>
+  return <Modal title="Import a question paper" onClose={busy ? undefined : close}>
+    <p className="modal-lead">Your original PDF stays in this browser. The server reads it temporarily to build your practice set.</p>
     <form onSubmit={extract}>
       <input ref={input} className="sr-only" type="file" accept=".pdf,application/pdf" tabIndex={-1} onChange={(event) => pick(event.target.files[0])}/>
       <button type="button" className={'dropzone' + (dragging ? ' dragging' : '')} disabled={busy} onClick={() => input.current.click()}
@@ -128,7 +152,7 @@ export function UploadDialog({ onClose, onImported }) {
         <small>{file ? (file.size / 1024 / 1024).toFixed(2) + ' MB · Click to replace' : 'PDF up to 20 MB and 100 pages'}</small>
       </button>
       <label className="key-start-label">Paper language
-        <select aria-label="Paper language" value={language} disabled={busy} onChange={(event) => { setLanguage(event.target.value); setJobId(null); }}>
+        <select aria-label="Paper language" value={language} disabled={busy} onChange={(event) => { setLanguage(event.target.value); forgetLocalCopy(); }}>
           <option value="auto">Automatic (Hindi and English)</option>
           <option value="hindi">Hindi (हिन्दी)</option>
           <option value="english">English</option>
@@ -142,15 +166,15 @@ export function UploadDialog({ onClose, onImported }) {
         <button type="button" className="button outline" aria-label={keyFile ? 'Replace answer key' : 'Choose answer key'}
           disabled={busy} onClick={() => keyInput.current.click()}>{keyFile ? 'Replace' : 'Choose file'}</button>
         {keyFile && <button type="button" className="icon-button" aria-label="Remove answer key" disabled={busy}
-          onClick={() => { setKeyFile(null); setJobId(null); setError(''); }}><X size={17}/></button>}
+          onClick={() => { setKeyFile(null); forgetLocalCopy(); setError(''); }}><X size={17}/></button>}
       </div>
       {keyFile && <label className="key-start-label">First question number for an unnumbered key
-        <input type="number" min="1" max="9999" value={startQuestion} disabled={busy} required onChange={(event) => { setStartQuestion(event.target.value); setJobId(null); }}/>
+        <input type="number" min="1" max="9999" value={startQuestion} disabled={busy} required onChange={(event) => { setStartQuestion(event.target.value); forgetLocalCopy(); }}/>
       </label>}
       {error && <p className="error-text" role="alert">{error}</p>}
       {busy && <p className="inline-loading" role="status"><LoaderCircle size={16} className="spin"/> {progress}</p>}
       <div className="modal-actions">
-        <button type="button" className="button outline" disabled={busy} onClick={onClose}>Cancel</button>
+        <button type="button" className="button outline" disabled={busy} onClick={close}>Cancel</button>
         <button type="submit" className="button primary" disabled={!file || busy}>{busy ? <LoaderCircle size={17} className="spin"/> : <UploadCloud size={17}/>} {jobId && !busy ? 'Check progress' : 'Extract questions'}</button>
       </div>
     </form>
